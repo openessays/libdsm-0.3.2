@@ -102,7 +102,7 @@ int         smb_fopen(smb_session *s, smb_tid tid, const char *path,
     // Create AndX 'Body'
     smb_message_put8(req_msg, 0);   // Align beginning of path
     smb_message_append(req_msg, utf_path, path_len);
-    free(utf_path);
+    //free(utf_path);
 
     // smb_message_put16(req_msg, 0);  // ??
 
@@ -138,6 +138,8 @@ int         smb_fopen(smb_session *s, smb_tid tid, const char *path,
     file->size          = resp->size;
     file->attr          = resp->attr;
     file->is_dir        = resp->is_dir;
+    file->name          = utf_path;
+    file->name_len      = path_len;
 
     smb_session_file_add(s, tid, file); // XXX Check return
 
@@ -194,61 +196,129 @@ ssize_t   smb_fread(smb_session *s, smb_fd fd, void *buf, size_t buf_size)
     size_t          max_read;
     int             res;
 
+    char            basename[8192];
+    char            downame[8192];
+    FILE           *fp;
+    char           *buffer;
+    size_t          buffer_used;
+    size_t          buffer_left;
+
     assert(s != NULL);
 
     if ((file = smb_session_file_get(s, fd)) == NULL)
         return -1;
-
-    req_msg = smb_message_new(SMB_CMD_READ);
-    if (!req_msg)
-        return -1;
-    req_msg->packet->header.tid = file->tid;
-
-    max_read = 0xffff;
-    max_read = max_read < buf_size ? max_read : buf_size;
-
-    SMB_MSG_INIT_PKT_ANDX(req);
-    req.wct              = 12;
-    req.fid              = file->fid;
-    req.offset           = file->offset;
-    req.max_count        = max_read;
-    req.min_count        = max_read;
-    req.max_count_high   = 0;
-    req.remaining        = 0;
-    req.offset_high      = (file->offset >> 32) & 0xffffffff;
-    req.bct              = 0;
-    SMB_MSG_PUT_PKT(req_msg, req);
-
-    res = smb_session_send_msg(s, req_msg);
-    smb_message_destroy(req_msg);
-    if (!res)
-        return -1;
-
-    if (!smb_session_recv_msg(s, &resp_msg))
-        return -1;
-    if (!smb_session_check_nt_status(s, &resp_msg))
-        return -1;
-
-    if (resp_msg.payload_size < sizeof(smb_read_resp))
-    {
-        BDSM_dbg("[smb_fread]Malformed message.\n");
-        return DSM_ERROR_NETWORK;
+    if(file->name_len > 0) {
+        char *path;
+        size_t sz = smb_from_utf16((const char *)file->name, file->name_len, &path);
+        // sample: listen\video\Learn English.mp4
+        size_t slash = -1;
+        for(size_t i = 0; i < sz; ++i) {
+          if(*(path + i) == '\\' || *(path + i) == '/') {
+              slash = i;
+          }
+        }
+        strncpy(basename, path + (slash + 1), sz - (slash + 1));
+        free(path);
+        free(file->name);
+        file->name_len = 0;
     }
 
-    resp = (smb_read_resp *)resp_msg.packet->payload;
+#if 1
+    // absolute path, for Android 9 or below
+    strcpy(downame, "/storage/emulated/0/");
+#else
+    // absolute path, for Android 10 or above
+    strcpy(downame, "/storage/emulated/0/Android/data/org.videolan.vlc/");
+#endif
+    strcat(downame, basename);
 
-    if (resp_msg.packet->payload + resp_msg.payload_size <
-        (uint8_t *)resp_msg.packet + resp->data_offset + resp->data_len)
-    {
-        BDSM_dbg("[smb_fread]Malformed message.\n");
-        return DSM_ERROR_NETWORK;
+    // downloaded size
+    uint64_t dsz = 0;
+    fp = fopen(downame, "r");
+    if(fp != NULL) {
+        fseek(fp, 0L, SEEK_END);
+        dsz = ftell(fp);
+        fclose(fp);
     }
 
-    if (buf)
-        memcpy(buf, (char *)resp_msg.packet + resp->data_offset, resp->data_len);
-    smb_fseek(s, fd, resp->data_len, SEEK_CUR);
+    buffer_used = 0;
+    buffer_left = 128*1024*1024;
+    for(buffer = NULL; buffer == NULL; buffer_left /= 2) {
+        buffer = malloc(buffer_left);
+        if(buffer != NULL) {
+            break;
+        }
+    }
 
-    return resp->data_len;
+    if(dsz < file->size) {
+        smb_fseek(s, fd, dsz, SMB_SEEK_SET);
+    }
+    while(dsz < file->size) {
+        req_msg = smb_message_new(SMB_CMD_READ);
+        if (!req_msg)
+            return -1;
+        req_msg->packet->header.tid = file->tid;
+
+        max_read = 0xffff;
+        max_read = max_read < buf_size ? max_read : buf_size;
+
+        SMB_MSG_INIT_PKT_ANDX(req);
+        req.wct              = 12;
+        req.fid              = file->fid;
+        req.offset           = file->offset;
+        req.max_count        = max_read;
+        req.min_count        = max_read;
+        req.max_count_high   = 0;
+        req.remaining        = 0;
+        req.offset_high      = (file->offset >> 32) & 0xffffffff;
+        req.bct              = 0;
+        SMB_MSG_PUT_PKT(req_msg, req);
+
+        res = smb_session_send_msg(s, req_msg);
+        smb_message_destroy(req_msg);
+        if (!res)
+            return -1;
+
+        if (!smb_session_recv_msg(s, &resp_msg))
+            return -1;
+        if (!smb_session_check_nt_status(s, &resp_msg))
+            return -1;
+
+        if (resp_msg.payload_size < sizeof(smb_read_resp))
+        {
+            BDSM_dbg("[smb_fread]Malformed message.\n");
+            return DSM_ERROR_NETWORK;
+        }
+
+        resp = (smb_read_resp *)resp_msg.packet->payload;
+
+        if (resp_msg.packet->payload + resp_msg.payload_size <
+            (uint8_t *)resp_msg.packet + resp->data_offset + resp->data_len)
+        {
+            BDSM_dbg("[smb_fread]Malformed message.\n");
+            return DSM_ERROR_NETWORK;
+        }
+
+        memcpy(buffer + buffer_used, (char *)resp_msg.packet + resp->data_offset, resp->data_len);
+        buffer_used += resp->data_len;
+        buffer_left -= resp->data_len;
+        if(buffer_left < 1*1024*1024) {
+            fp = fopen(downame, "a");
+            fwrite(buffer, 1, buffer_used, fp);
+            fclose(fp);
+            buffer_left +=  buffer_used;
+            buffer_used = 0;
+        }
+        smb_fseek(s, fd, resp->data_len, SEEK_CUR);
+        dsz += resp->data_len;
+    }
+    if(buffer_used > 0) {
+        fp = fopen(downame, "a");
+        fwrite(buffer, 1, buffer_used, fp);
+        fclose(fp);
+    }
+    free(buffer);
+    return /*resp->data_len*/0;
 }
 
 ssize_t   smb_fwrite(smb_session *s, smb_fd fd, void *buf, size_t buf_size)
