@@ -207,19 +207,22 @@ ssize_t   smb_fread(smb_session *s, smb_fd fd, void *buf, size_t buf_size)
 
     if ((file = smb_session_file_get(s, fd)) == NULL)
         return -1;
-    if(file->name_len > 0) {
-        char *path;
+
+    if (file->name_len > 0) {
+        char *path = NULL;
         size_t sz = smb_from_utf16((const char *)file->name, file->name_len, &path);
         // sample: listen\video\Learn English.mp4
         size_t slash = -1;
-        for(size_t i = 0; i < sz; ++i) {
-          if(*(path + i) == '\\' || *(path + i) == '/') {
+        for (size_t i = 0; i < sz; ++i) {
+          if (*(path + i) == '\\' || *(path + i) == '/') {
               slash = i;
           }
         }
         strncpy(basename, path + (slash + 1), sz - (slash + 1));
         free(path);
         free(file->name);
+        // avoid double free
+        file->name = NULL;
         file->name_len = 0;
     }
 
@@ -235,7 +238,7 @@ ssize_t   smb_fread(smb_session *s, smb_fd fd, void *buf, size_t buf_size)
     // downloaded size
     uint64_t dsz = 0;
     fp = fopen(downame, "r");
-    if(fp != NULL) {
+    if (fp != NULL) {
         fseek(fp, 0L, SEEK_END);
         dsz = ftell(fp);
         fclose(fp);
@@ -243,17 +246,17 @@ ssize_t   smb_fread(smb_session *s, smb_fd fd, void *buf, size_t buf_size)
 
     buffer_used = 0;
     buffer_left = 128*1024*1024;
-    for(buffer = NULL; buffer == NULL; buffer_left /= 2) {
+    for (buffer = NULL; buffer == NULL; buffer_left /= 2) {
         buffer = malloc(buffer_left);
-        if(buffer != NULL) {
+        if (buffer != NULL) {
             break;
         }
     }
 
-    if(dsz < file->size) {
+    if (dsz < file->size) {
         smb_fseek(s, fd, dsz, SMB_SEEK_SET);
     }
-    while(dsz < file->size) {
+    while (dsz < file->size) {
         req_msg = smb_message_new(SMB_CMD_READ);
         if (!req_msg)
             return -1;
@@ -302,7 +305,7 @@ ssize_t   smb_fread(smb_session *s, smb_fd fd, void *buf, size_t buf_size)
         memcpy(buffer + buffer_used, (char *)resp_msg.packet + resp->data_offset, resp->data_len);
         buffer_used += resp->data_len;
         buffer_left -= resp->data_len;
-        if(buffer_left < 1*1024*1024) {
+        if (buffer_left < 1*1024*1024) {
             fp = fopen(downame, "a");
             fwrite(buffer, 1, buffer_used, fp);
             fclose(fp);
@@ -312,7 +315,7 @@ ssize_t   smb_fread(smb_session *s, smb_fd fd, void *buf, size_t buf_size)
         smb_fseek(s, fd, resp->data_len, SEEK_CUR);
         dsz += resp->data_len;
     }
-    if(buffer_used > 0) {
+    if (buffer_used > 0) {
         fp = fopen(downame, "a");
         fwrite(buffer, 1, buffer_used, fp);
         fclose(fp);
